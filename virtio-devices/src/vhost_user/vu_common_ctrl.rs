@@ -3,7 +3,7 @@
 
 use std::ffi;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
@@ -17,7 +17,8 @@ use vhost::vhost_user::message::{
     VhostUserProtocolFeatures, VhostUserVirtioFeatures,
 };
 use vhost::vhost_user::{
-    Frontend, FrontendReqHandler, VhostUserFrontend, VhostUserFrontendReqHandler,
+    Error as VhostUserError, Frontend, FrontendReqHandler, VhostUserFrontend,
+    VhostUserFrontendReqHandler,
 };
 use vhost::{VhostBackend, VhostUserDirtyLogRegion, VhostUserMemoryRegionInfo, VringConfigData};
 use virtio_queue::desc::RawDescriptor;
@@ -50,6 +51,17 @@ pub struct VhostUserConfig {
 struct VringInfo {
     config_data: VringConfigData,
     used_guest_addr: u64,
+}
+
+fn vhost_user_connect_error_is_retryable(error: &vhost::Error) -> bool {
+    match error {
+        vhost::Error::VhostUserProtocol(VhostUserError::SocketConnect(io_err)) => matches!(
+            io_err.kind(),
+            ErrorKind::ConnectionRefused | ErrorKind::NotFound | ErrorKind::TimedOut
+        ),
+        vhost::Error::VhostUserProtocol(VhostUserError::SocketRetry(_)) => true,
+        _ => false,
+    }
 }
 
 #[derive(Clone)]
@@ -390,8 +402,69 @@ impl VhostUserHandle {
 
             info!("Binding vhost-user listener...");
             let listener = UnixListener::bind(socket_path).map_err(Error::BindSocket)?;
+            listener
+                .set_nonblocking(true)
+                .map_err(Error::SetSocketNonBlocking)?;
+
+            #[repr(u64)]
+            enum AcceptEvent {
+                Listener = 0,
+                Kill = 1,
+            }
+
+            let epoll = Epoll::new().map_err(Error::EpollCreate)?;
+            epoll
+                .ctl(
+                    ControlOperation::Add,
+                    listener.as_raw_fd(),
+                    EpollEvent::new(EventSet::IN, AcceptEvent::Listener as u64),
+                )
+                .map_err(Error::EpollCtl)?;
+
+            if let Some(kill_evt) = kill_evt {
+                epoll
+                    .ctl(
+                        ControlOperation::Add,
+                        kill_evt.as_raw_fd(),
+                        EpollEvent::new(EventSet::IN, AcceptEvent::Kill as u64),
+                    )
+                    .map_err(Error::EpollCtl)?;
+            }
+
             info!("Waiting for incoming vhost-user connection...");
-            let (stream, _) = listener.accept().map_err(Error::AcceptConnection)?;
+            let mut events = [EpollEvent::default(); 1];
+
+            let stream = loop {
+                loop {
+                    match epoll.wait(-1, &mut events) {
+                        Ok(_) => break,
+                        Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(Error::EpollWait(e)),
+                    }
+                }
+
+                match events[0].data() {
+                    x if x == AcceptEvent::Listener as u64 => match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                ErrorKind::WouldBlock | ErrorKind::Interrupted
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(e) => return Err(Error::AcceptConnection(e)),
+                    },
+                    x if x == AcceptEvent::Kill as u64 => {
+                        info!(
+                            "Aborting vhost-user accept for socket {socket_path}: kill event received"
+                        );
+                        return Err(Error::ConnectKilled);
+                    }
+                    _ => unreachable!(),
+                }
+            };
 
             Ok(VhostUserHandle {
                 vu: Frontend::from_stream(stream, num_queues),
@@ -441,7 +514,7 @@ impl VhostUserHandle {
             let mut events = [EpollEvent::default(); 1];
 
             loop {
-                let err = match Frontend::connect(socket_path, num_queues) {
+                let connect_err = match Frontend::connect(socket_path, num_queues) {
                     Ok(m) => {
                         return Ok(VhostUserHandle {
                             vu: m,
@@ -457,17 +530,24 @@ impl VhostUserHandle {
                     Err(e) => e,
                 };
 
+                if !vhost_user_connect_error_is_retryable(&connect_err) {
+                    error!(
+                        "Failed to connect to backend socket {socket_path} with unrecoverable error: {connect_err:?}"
+                    );
+                    return Err(Error::VhostUserConnect(connect_err));
+                }
+
                 if start.elapsed() >= CONNECT_TIMEOUT {
                     error!(
-                        "Failed connecting the backend after trying for 1 minute for socket {socket_path}: {err:?}"
+                        "Failed connecting the backend after trying for 1 minute for socket {socket_path}: {connect_err:?}"
                     );
-                    return Err(Error::VhostUserConnect(err));
+                    return Err(Error::VhostUserConnect(connect_err));
                 }
 
                 loop {
                     match epoll.wait(-1, &mut events) {
                         Ok(_) => break,
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                         Err(e) => return Err(Error::EpollWait(e)),
                     }
                 }

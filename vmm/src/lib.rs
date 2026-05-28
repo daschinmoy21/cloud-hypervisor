@@ -2654,6 +2654,7 @@ mod unit_tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::config::ValidationError;
     #[cfg(target_arch = "x86_64")]
     use crate::vm_config::DebugConsoleConfig;
     use crate::vm_config::{
@@ -3017,6 +3018,16 @@ mod unit_tests {
                 .unwrap()[0],
             generic_vhost_user_config
         );
+
+        assert!(matches!(
+            vmm.vm_add_generic_vhost_user(GenericVhostUserConfig::parse(
+                "virtio_id=26,socket=/tmp/sock,queue_sizes=[1024]"
+            )
+            .unwrap()),
+            Err(VmError::ConfigValidation(
+                ValidationError::VhostUserSocketInUse(socket)
+            )) if socket == PathBuf::from("/tmp/sock")
+        ));
     }
 
     #[test]

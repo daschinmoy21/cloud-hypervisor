@@ -247,6 +247,9 @@ pub enum ValidationError {
     /// No socket provided for vhost_use
     #[error("No socket provided when using vhost-user")]
     VhostUserMissingSocket,
+    /// Vhost-user socket path already in use.
+    #[error("vhost-user socket path already in use: {0:?}")]
+    VhostUserSocketInUse(PathBuf),
     /// Trying to use IOMMU without PCI
     #[error("Using an IOMMU without PCI support is unsupported")]
     IommuUnsupported,
@@ -2872,6 +2875,17 @@ impl VmConfig {
         Ok(())
     }
 
+    fn validate_vhost_user_socket(
+        sockets: &mut HashSet<PathBuf>,
+        socket: PathBuf,
+    ) -> ValidationResult<()> {
+        if !sockets.insert(socket.clone()) {
+            return Err(ValidationError::VhostUserSocketInUse(socket));
+        }
+
+        Ok(())
+    }
+
     pub fn backed_by_shared_memory(&self) -> bool {
         if self.memory.shared || self.memory.hugepages {
             return true;
@@ -2894,6 +2908,7 @@ impl VmConfig {
     // configuration.
     pub fn validate(&mut self) -> ValidationResult<BTreeSet<String>> {
         let mut id_list = BTreeSet::new();
+        let mut vhost_user_sockets = HashSet::new();
 
         // Is the payload configuration bootable?
         self.payload
@@ -3008,6 +3023,14 @@ impl VmConfig {
                     return Err(ValidationError::VhostUserMissingSocket);
                 }
                 if disk.vhost_user
+                    && let Some(socket) = &disk.vhost_socket
+                {
+                    Self::validate_vhost_user_socket(
+                        &mut vhost_user_sockets,
+                        PathBuf::from(socket.as_str()),
+                    )?;
+                }
+                if disk.vhost_user
                     && (disk.rate_limiter_config.is_some() || disk.rate_limit_group.is_some())
                 {
                     return Err(ValidationError::VhostUserRateLimiterNotSupported);
@@ -3040,6 +3063,14 @@ impl VmConfig {
                 if net.vhost_user && net.rate_limiter_config.is_some() {
                     return Err(ValidationError::VhostUserRateLimiterNotSupported);
                 }
+                if net.vhost_user
+                    && let Some(socket) = &net.vhost_socket
+                {
+                    Self::validate_vhost_user_socket(
+                        &mut vhost_user_sockets,
+                        PathBuf::from(socket.as_str()),
+                    )?;
+                }
                 net.validate(self)?;
                 self.iommu |= net.pci_common.iommu;
 
@@ -3052,6 +3083,7 @@ impl VmConfig {
                 return Err(ValidationError::VhostUserRequiresSharedMemory);
             }
             for fs in fses {
+                Self::validate_vhost_user_socket(&mut vhost_user_sockets, fs.socket.clone())?;
                 fs.validate(self)?;
 
                 Self::validate_identifier(&mut id_list, &fs.pci_common.id)?;
@@ -3063,6 +3095,10 @@ impl VmConfig {
                 return Err(ValidationError::VhostUserRequiresSharedMemory);
             }
             for generic_vhost_user_device in generic_vhost_user_devices {
+                Self::validate_vhost_user_socket(
+                    &mut vhost_user_sockets,
+                    generic_vhost_user_device.socket.clone(),
+                )?;
                 generic_vhost_user_device.validate(self)?;
 
                 Self::validate_identifier(&mut id_list, &generic_vhost_user_device.pci_common.id)?;
@@ -5302,6 +5338,86 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         }]);
         still_valid_config.memory.shared = true;
         still_valid_config.validate().unwrap();
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.memory.shared = true;
+        invalid_config.disks = Some(vec![
+            DiskConfig {
+                path: None,
+                vhost_user: true,
+                vhost_socket: Some("/tmp/sock".to_owned()),
+                ..disk_fixture()
+            },
+            DiskConfig {
+                path: None,
+                vhost_user: true,
+                vhost_socket: Some("/tmp/sock".to_owned()),
+                ..disk_fixture()
+            },
+        ]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::VhostUserSocketInUse(PathBuf::from(
+                "/tmp/sock"
+            )))
+        );
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.memory.shared = true;
+        invalid_config.disks = Some(vec![DiskConfig {
+            path: None,
+            vhost_user: true,
+            vhost_socket: Some("/tmp/sock".to_owned()),
+            ..disk_fixture()
+        }]);
+        invalid_config.net = Some(vec![NetConfig {
+            vhost_user: true,
+            vhost_socket: Some("/tmp/sock".to_owned()),
+            ..net_fixture()
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::VhostUserSocketInUse(PathBuf::from(
+                "/tmp/sock"
+            )))
+        );
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.memory.shared = true;
+        invalid_config.net = Some(vec![NetConfig {
+            vhost_user: true,
+            vhost_socket: Some("/tmp/sock".to_owned()),
+            ..net_fixture()
+        }]);
+        invalid_config.fs = Some(vec![FsConfig {
+            socket: PathBuf::from("/tmp/sock"),
+            ..fs_fixture()
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::VhostUserSocketInUse(PathBuf::from(
+                "/tmp/sock"
+            )))
+        );
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.memory.shared = true;
+        invalid_config.fs = Some(vec![FsConfig {
+            socket: PathBuf::from("/tmp/sock"),
+            ..fs_fixture()
+        }]);
+        invalid_config.generic_vhost_user = Some(vec![GenericVhostUserConfig {
+            socket: PathBuf::from("/tmp/sock"),
+            queue_sizes: vec![1024],
+            device_type: VIRTIO_ID_FS,
+            pci_common: PciDeviceCommonConfig::default(),
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::VhostUserSocketInUse(PathBuf::from(
+                "/tmp/sock"
+            )))
+        );
 
         // Test vhost_user with rate limiting for disk
         let mut invalid_config = valid_config.clone();

@@ -56,6 +56,8 @@ pub enum Error {
     BadQueueNum,
     #[error("Failed binding vhost-user socket")]
     BindSocket(#[source] io::Error),
+    #[error("Failed setting vhost-user socket nonblocking")]
+    SetSocketNonBlocking(#[source] io::Error),
     #[error("Creating kill eventfd failed")]
     CreateKillEventFd(#[source] io::Error),
     #[error("Cloning kill eventfd failed")]

@@ -629,6 +629,10 @@ pub enum DeviceManagerError {
     #[error("vfio-user socket path already in use: {0:?}")]
     UserDeviceSocketInUse(std::path::PathBuf),
 
+    /// vhost-user socket path already in use by another vhost-user device.
+    #[error("vhost-user socket path already in use: {0:?}")]
+    VhostUserSocketInUse(PathBuf),
+
     /// Error activating virtio device
     #[error("Error activating virtio device")]
     VirtioActivate(#[source] ActivateError),
@@ -5156,11 +5160,63 @@ impl DeviceManager {
             .unwrap_or_default()
     }
 
+    fn vhost_user_socket_in_use(&self, socket: &PathBuf) -> bool {
+        let config = self.config.lock().unwrap();
+
+        let disk_match = config.disks.as_ref().is_some_and(|disks| {
+            disks.iter().any(|disk| {
+                disk.vhost_user
+                    && disk
+                        .vhost_socket
+                        .as_ref()
+                        .is_some_and(|s| socket.as_path() == std::path::Path::new(s.as_str()))
+            })
+        });
+
+        let net_match = config.net.as_ref().is_some_and(|nets| {
+            nets.iter().any(|net| {
+                net.vhost_user
+                    && net
+                        .vhost_socket
+                        .as_ref()
+                        .is_some_and(|s| socket.as_path() == std::path::Path::new(s.as_str()))
+            })
+        });
+
+        let fs_match = config
+            .fs
+            .as_ref()
+            .is_some_and(|fses| {
+                fses.iter()
+                    .any(|fs| fs.socket.as_path() == socket.as_path())
+            });
+
+        let generic_match = config
+            .generic_vhost_user
+            .as_ref()
+            .is_some_and(|devices| {
+                devices
+                    .iter()
+                    .any(|device| device.socket.as_path() == socket.as_path())
+            });
+
+        disk_match || net_match || fs_match || generic_match
+    }
+
     pub fn add_disk(&mut self, disk_cfg: &mut DiskConfig) -> DeviceManagerResult<PciDeviceInfo> {
         self.validate_identifier(&disk_cfg.pci_common.id)?;
 
         if disk_cfg.pci_common.iommu && !self.is_iommu_segment(disk_cfg.pci_common.pci_segment) {
             return Err(DeviceManagerError::InvalidIommuHotplug);
+        }
+
+        if disk_cfg.vhost_user
+            && let Some(socket) = &disk_cfg.vhost_socket
+        {
+            let socket = PathBuf::from(socket.as_str());
+            if self.vhost_user_socket_in_use(&socket) {
+                return Err(DeviceManagerError::VhostUserSocketInUse(socket));
+            }
         }
 
         let device = self.make_virtio_block_device(disk_cfg, true, None)?;
@@ -5169,6 +5225,12 @@ impl DeviceManager {
 
     pub fn add_fs(&mut self, fs_cfg: &mut FsConfig) -> DeviceManagerResult<PciDeviceInfo> {
         self.validate_identifier(&fs_cfg.pci_common.id)?;
+
+        if self.vhost_user_socket_in_use(&fs_cfg.socket) {
+            return Err(DeviceManagerError::VhostUserSocketInUse(
+                fs_cfg.socket.clone(),
+            ));
+        }
 
         let device = self.make_virtio_fs_device(fs_cfg, None)?;
         self.hotplug_virtio_pci_device(device)
@@ -5179,6 +5241,12 @@ impl DeviceManager {
         generic_vhost_user_cfg: &mut GenericVhostUserConfig,
     ) -> DeviceManagerResult<PciDeviceInfo> {
         self.validate_identifier(&generic_vhost_user_cfg.pci_common.id)?;
+
+        if self.vhost_user_socket_in_use(&generic_vhost_user_cfg.socket) {
+            return Err(DeviceManagerError::VhostUserSocketInUse(
+                generic_vhost_user_cfg.socket.clone(),
+            ));
+        }
 
         let device = self.make_generic_vhost_user_device(generic_vhost_user_cfg, None)?;
         self.hotplug_virtio_pci_device(device)
@@ -5200,6 +5268,15 @@ impl DeviceManager {
 
         if net_cfg.pci_common.iommu && !self.is_iommu_segment(net_cfg.pci_common.pci_segment) {
             return Err(DeviceManagerError::InvalidIommuHotplug);
+        }
+
+        if net_cfg.vhost_user
+            && let Some(socket) = &net_cfg.vhost_socket
+        {
+            let socket = PathBuf::from(socket.as_str());
+            if self.vhost_user_socket_in_use(&socket) {
+                return Err(DeviceManagerError::VhostUserSocketInUse(socket));
+            }
         }
 
         let device = self.make_virtio_net_device(net_cfg, None)?;
