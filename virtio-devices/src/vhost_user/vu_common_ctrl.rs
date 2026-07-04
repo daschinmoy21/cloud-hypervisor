@@ -3,6 +3,7 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
@@ -17,9 +18,13 @@ use vhost::vhost_user::message::{
     VhostUserProtocolFeatures, VhostUserVirtioFeatures,
 };
 use vhost::vhost_user::{
-    Frontend, FrontendReqHandler, VhostUserFrontend, VhostUserFrontendReqHandler,
+    Error as VhostUserError, Frontend, FrontendReqHandler, VhostUserFrontend,
+    VhostUserFrontendReqHandler,
 };
-use vhost::{VhostBackend, VhostUserDirtyLogRegion, VhostUserMemoryRegionInfo, VringConfigData};
+use vhost::{
+    Error as VhostError, VhostBackend, VhostUserDirtyLogRegion, VhostUserMemoryRegionInfo,
+    VringConfigData,
+};
 use virtio_queue::desc::RawDescriptor;
 use virtio_queue::{Queue, QueueT};
 use vm_memory::guest_memory::Error as MmapError;
@@ -381,11 +386,18 @@ impl VhostUserHandle {
         socket_path: &str,
         num_queues: u64,
         unlink_socket: bool,
-        kill_evt: Option<&EventFd>,
+        kill_evt: &EventFd,
     ) -> Result<Self> {
         if server {
             if unlink_socket {
-                fs::remove_file(socket_path).map_err(Error::RemoveSocketPath)?;
+                // Remove any stale socket left by a previous backend. A
+                // missing path is the normal first-boot case, so only a
+                // genuine failure (e.g. permission denied) is an error.
+                match fs::remove_file(socket_path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(Error::RemoveSocketPath(e)),
+                }
             }
 
             info!("Binding vhost-user listener...");
@@ -406,7 +418,6 @@ impl VhostUserHandle {
         } else {
             const RETRY_INTERVAL: Duration = Duration::from_millis(100);
             const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
-
             #[repr(u64)]
             enum ConnectEvent {
                 Timer = 0,
@@ -427,15 +438,13 @@ impl VhostUserHandle {
                 )
                 .map_err(Error::EpollCtl)?;
 
-            if let Some(kill_evt) = kill_evt {
-                epoll
-                    .ctl(
-                        ControlOperation::Add,
-                        kill_evt.as_raw_fd(),
-                        EpollEvent::new(EventSet::IN, ConnectEvent::Kill as u64),
-                    )
-                    .map_err(Error::EpollCtl)?;
-            }
+            epoll
+                .ctl(
+                    ControlOperation::Add,
+                    kill_evt.as_raw_fd(),
+                    EpollEvent::new(EventSet::IN, ConnectEvent::Kill as u64),
+                )
+                .map_err(Error::EpollCtl)?;
 
             let start = Instant::now();
             let mut events = [EpollEvent::default(); 1];
@@ -457,18 +466,45 @@ impl VhostUserHandle {
                     Err(e) => e,
                 };
 
-                if start.elapsed() >= CONNECT_TIMEOUT {
+                // Fail immediately on non-retryable errors (e.g. PermissionDenied, AddrInUse)
+                let retryable = match &err {
+                    VhostError::VhostUserProtocol(VhostUserError::SocketConnect(io_err)) => {
+                        match io_err.kind() {
+                            io::ErrorKind::NotFound | io::ErrorKind::Interrupted => true,
+                            io::ErrorKind::ConnectionRefused => {
+                                // Only retry if the path is known to be a Unix socket
+                                if let Ok(metadata) = fs::metadata(socket_path) {
+                                    metadata.file_type().is_socket()
+                                } else {
+                                    false
+                                }
+                            }
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                };
+
+                if !retryable {
                     error!(
-                        "Failed connecting the backend after trying for 1 minute for socket {socket_path}: {err:?}"
+                        "Failed connecting to vhost-user backend for socket {socket_path}: {err:?}"
                     );
                     return Err(Error::VhostUserConnect(err));
                 }
 
+                if start.elapsed() >= CONNECT_TIMEOUT {
+                    error!("Timed out waiting for vhost-user connection on socket {socket_path}");
+                    return Err(Error::VhostUserConnectTimeout);
+                }
+
                 loop {
-                    match epoll.wait(-1, &mut events) {
-                        Ok(_) => break,
+                    let event_count = match epoll.wait(-1, &mut events) {
+                        Ok(count) => count,
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                         Err(e) => return Err(Error::EpollWait(e)),
+                    };
+                    if event_count > 0 {
+                        break;
                     }
                 }
 
@@ -485,7 +521,14 @@ impl VhostUserHandle {
                             .wait()
                             .map_err(|e| Error::TimerFdWait(e.into()))?;
                     }
-                    _ => unreachable!(),
+                    x => {
+                        error!(
+                            "Unexpected epoll event data {x} on vhost-user connect for {socket_path}"
+                        );
+                        return Err(Error::EpollWait(io::Error::other(format!(
+                            "unexpected epoll event data: {x}"
+                        ))));
+                    }
                 }
             }
         }
