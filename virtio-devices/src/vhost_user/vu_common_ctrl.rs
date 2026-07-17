@@ -3,6 +3,7 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
@@ -389,7 +390,14 @@ impl VhostUserHandle {
     ) -> Result<Self> {
         if server {
             if unlink_socket {
-                fs::remove_file(socket_path).map_err(Error::RemoveSocketPath)?;
+                // Remove any stale socket left by a previous backend. A
+                // missing path is the normal first-boot case, so only a
+                // genuine failure (e.g. permission denied) is an error.
+                match fs::remove_file(socket_path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(Error::RemoveSocketPath(e)),
+                }
             }
 
             info!("Binding vhost-user listener...");
@@ -410,7 +418,6 @@ impl VhostUserHandle {
         } else {
             const RETRY_INTERVAL: Duration = Duration::from_millis(100);
             const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
-
             #[repr(u64)]
             enum ConnectEvent {
                 Timer = 0,
@@ -484,10 +491,13 @@ impl VhostUserHandle {
                 }
 
                 loop {
-                    match epoll.wait(-1, &mut events) {
-                        Ok(_) => break,
+                    let event_count = match epoll.wait(-1, &mut events) {
+                        Ok(count) => count,
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                         Err(e) => return Err(Error::EpollWait(e)),
+                    };
+                    if event_count > 0 {
+                        break;
                     }
                 }
 
@@ -504,7 +514,14 @@ impl VhostUserHandle {
                             .wait()
                             .map_err(|e| Error::TimerFdWait(e.into()))?;
                     }
-                    _ => unreachable!(),
+                    x => {
+                        error!(
+                            "Unexpected epoll event data {x} on vhost-user connect for {socket_path}"
+                        );
+                        return Err(Error::EpollWait(io::Error::other(format!(
+                            "unexpected epoll event data: {x}"
+                        ))));
+                    }
                 }
             }
         }
